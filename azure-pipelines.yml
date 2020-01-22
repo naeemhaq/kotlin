@@ -1,0 +1,165 @@
+# Gradle
+# Build your Java project and run tests with Gradle using a Gradle wrapper script.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/java
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - master
+
+variables:
+  - name: vmimage
+    value: ubuntu-latest
+  - name: imageRepository
+    value: ca.canada.ssc/demo # TODO: Update to fully qualified path of image repo
+  - name: dockerRegistryServiceConnection
+    value: acrRepoServiceConnection # TODO: Update to name of ACR service connection
+  - name: imagePullSecret
+    value: myregistrykey
+  - name: containerRegistry
+    value: sscdemo.azurecr.io # TODO: Update to the address of your ACR repo
+  - name: anchoreVersion
+    value: 0.4.1
+  - name: kubernetesProdServiceConnection
+    value: Production-default-kotlin-prod-1569260205148 # TODO: Replace with your Service Connection Name
+  - name: kubernetesStagingServiceConnection
+    value: Staging-default-kotlin-staging-1569258920712 # TODO: Replace with your Service Connection Name
+  - name: kubernetesStagingNamespace
+    value: kotlin-staging   # TODO: Replace with Kubernetes namespace for staging
+  - name: kubernetesProdNamespace
+    value: kotlin-prod # TODO: Replace with Kubernetes namespace for production
+  # expecting kubernetesStagingServiceConnection and kubernetesProdServiceConnection
+
+stages:
+  - stage: BuildStage
+    displayName: Build stage
+    jobs:
+      - job: BuildJob
+        displayName: Build
+        pool:
+          vmImage: $(vmimage)
+        steps:
+#          - task: SonarQubePrepare@4
+          #            inputs:
+          #              SonarQube: 'sonarqube'
+          #              scannerMode: 'Other'
+          - task: Gradle@2
+            inputs:
+              workingDirectory: ''
+              gradleWrapperFile: 'gradlew'
+              gradleOptions: '-Xmx3072m'
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '1.11'
+              jdkArchitectureOption: 'x64'
+              publishJUnitResults: true
+              testResultsFiles: '**/TEST-*.xml'
+              tasks: 'build jacocoTestReport dockerCreateDockerfile publish'
+              checkStyleRunAnalysis: true
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: 'JaCoCo' # Options: cobertura, jaCoCo
+              summaryFileLocation: $(System.DefaultWorkingDirectory)/build/reports/jacoco/test/jacocoTestReport.xml
+              pathToSources: $(System.DefaultWorkingDirectory)/src/main/kotlin/
+              reportDirectory: $(System.DefaultWorkingDirectory)/build/reports/jacoco/test/html/
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/build/reports/checkstyle/main.html'
+              artifact: Checkstyle
+          - task: PublishPipelineArtifact@1
+            inputs:
+              artifactName: 'manifests'
+              path: 'src/deploy/kubernetes'
+          - task: PublishPipelineArtifact@1
+            inputs:
+              artifactName: 'docker'
+              path: 'build/docker'
+      - job: DockerJob
+        displayName: Docker Build
+        dependsOn: BuildJob
+        pool:
+          vmImage: $(vmimage)
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: 'docker'
+              downloadPath: '$(System.ArtifactsDirectory)/docker'
+          - task: Docker@2
+            displayName: Login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+          - task: Docker@2
+            displayName: Build & Push Docker Image
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepository)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              dockerfile: '$(System.ArtifactsDirectory)/docker/Dockerfile'
+              tags: |
+                $(Build.SourceVersion)
+                staging
+          - task: CmdLine@2
+            displayName: Anchore Scan
+            inputs:
+              script: |
+                curl -s http://ci-tools.anchore.io/inline_scan-v$(anchoreVersion) | \
+                bash -s -- -r \
+                  -d $(System.ArtifactsDirectory)/docker/Dockerfile \
+                  -b config/anchore-policy.json \
+                  $(containerRegistry)/$(imageRepository):$(Build.SourceVersion)
+
+                echo "Parsing anchore reports."
+                bash <<'EOF'
+                for f in anchore-reports/*; do
+                  if [[ "$f" =~ "content-os" ]]; then
+                    printf "\n%s\n" "The following OS packages are installed on $(imageRepository):"
+                    jq '[.content | sort_by(.package) | .[] | {package: .package, version: .version}]' $f || true
+                  fi
+                  if [[ "$f" =~ "vuln" ]]; then
+                    printf "\n%s\n" "The following vulnerabilities were found on $(imageRepository):"
+                    jq '[.vulnerabilities | group_by(.package) | .[] | {package: .[0].package, vuln: [.[].vuln]}]' $f || true
+                  fi
+                done
+                EOF
+          - task: PublishPipelineArtifact@1
+            inputs:
+              artifactName: 'anchore-reports'
+              path: anchore-reports
+          - task: Docker@2
+            displayName: Logout of ACR
+            inputs:
+              command: logout
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+  - stage: DeployStagingStage
+    displayName: Deploy To Staging
+    dependsOn: BuildStage
+    jobs:
+      - template: src/pipeline/templates/jobs/deploy.yml  # Template reference
+        parameters:
+          vmImage: $(vmImageName)
+          environment: Staging
+          dockerRegistryServiceConnection: $(dockerRegistryServiceConnection)
+          kubernetesServiceConnection: $(kubernetesStagingServiceConnection)
+          imagePullSecret: $(imagePullSecret)
+          containerRegistry: $(containerRegistry)
+          imageRepository: $(imageRepository)
+          kubernetesNamespace: $(kubernetesStagingNamespace)
+
+  - stage: DeployProdStage
+    displayName: Deploy To Production
+    dependsOn: DeployStagingStage
+    jobs:
+      - template: src/pipeline/templates/jobs/deploy.yml  # Template reference
+        parameters:
+          vmImage: $(vmImageName)
+          environment: Production
+          dockerRegistryServiceConnection: $(dockerRegistryServiceConnection)
+          kubernetesServiceConnection: $(kubernetesProdServiceConnection)
+          imagePullSecret: $(imagePullSecret)
+          containerRegistry: $(containerRegistry)
+          imageRepository: $(imageRepository)
+          kubernetesNamespace: $(kubernetesProdNamespace)
+

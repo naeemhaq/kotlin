@@ -1,0 +1,51 @@
+parameters:
+  name: 'DeployJob'  # defaults for any parameters that aren't specified
+  vmImage: ''
+  environment: ''
+  dockerRegistryServiceConnection: ''
+  kubernetesServiceConnection: ''
+  imagePullSecret: ''
+  containerRegistry: ''
+  imageRepository: ''
+  kubernetesNamespace: 'default'
+
+jobs:
+  - deployment: ${{ parameters.name }}
+    displayName: Deploy job
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+    environment: ${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - task: DownloadPipelineArtifact@2
+              inputs:
+                artifactName: 'manifests'
+                downloadPath: '$(System.ArtifactsDirectory)/manifests'
+
+            - task: KubernetesManifest@0
+              displayName: Create imagePullSecret
+              inputs:
+                action: createSecret
+                secretType: dockerRegistry
+                secretName: ${{ parameters.imagePullSecret }}
+                namespace: ${{ parameters.kubernetesNamespace }}
+                dockerRegistryEndpoint: ${{ parameters.dockerRegistryServiceConnection }}
+                kubernetesServiceConnection: ${{ parameters.kubernetesServiceConnection }}
+
+            - task: KubernetesManifest@0
+              displayName: Deploy to Kubernetes cluster
+              inputs:
+                action: deploy
+                namespace: ${{ parameters.kubernetesNamespace }}
+                manifests: |
+                  $(System.ArtifactsDirectory)/manifests/deployment.yaml
+                  $(System.ArtifactsDirectory)/manifests/service.yaml
+                  $(System.ArtifactsDirectory)/manifests/ingress.yaml
+                imagePullSecrets: |
+                  ${{ parameters.imagePullSecret }}
+                containers: |
+                  ${{ parameters.containerRegistry }}/${{ parameters.imageRepository }}:$(Build.SourceVersion)
+                kubernetesServiceConnection: ${{ parameters.kubernetesServiceConnection }}
+

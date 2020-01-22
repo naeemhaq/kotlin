@@ -1,0 +1,145 @@
+import com.bmuschko.gradle.docker.tasks.image.Dockerfile
+
+plugins {
+    id "org.springframework.boot" version "2.1.7.RELEASE"
+    id "io.spring.dependency-management" version "1.0.8.RELEASE"
+    id 'org.jetbrains.kotlin.jvm' version '1.3.50'
+    id "org.jetbrains.kotlin.plugin.spring" version "1.3.50"
+    id 'application'
+    id 'jacoco'
+    id "io.gitlab.arturbosch.detekt" version "1.0.1"
+    id 'checkstyle'
+    id 'com.bmuschko.docker-spring-boot-application' version '4.10.0'
+    id 'maven-publish'
+    id "org.sonarqube" version "2.7"
+}
+
+group = "ca.canada.ssc"
+version = "0.0.2-SNAPSHOT"
+java.sourceCompatibility = JavaVersion.VERSION_11
+java.targetCompatibility = java.sourceCompatibility
+
+mainClassName = "ca.canada.ssc.demo.DemoApplication"
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    springCloudVersion = "Greenwich.SR2"
+}
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-hateoas")
+    implementation("org.springframework.boot:spring-boot-starter-webflux")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+    implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
+    implementation("org.springframework.cloud:spring-cloud-starter")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("io.projectreactor:reactor-test")
+}
+
+dependencyManagement {
+    imports {
+        mavenBom("org.springframework.cloud:spring-cloud-dependencies:${property("springCloudVersion")}")
+    }
+}
+
+publishing {
+    publications {
+        myLibrary(MavenPublication) {
+            from components.java
+        }
+    }
+
+    repositories {
+        // Only include repo if we have the required access token to avoid failing locally
+        if (System.getenv("AZURE_ARTIFACTS_ENV_ACCESS_TOKEN") || project.hasProperty
+                ("azureArtifactsGradleAccessToken")) {
+            maven {
+                url 'https://pkgs.dev.azure.com/darylrobbins/_packaging/darylrobbins/maven/v1'
+                credentials {
+                    username "AZURE_ARTIFACTS"
+                    password System.getenv("AZURE_ARTIFACTS_ENV_ACCESS_TOKEN") ?: "${azureArtifactsGradleAccessToken}"
+                }
+            }
+        }
+    }
+}
+
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).all {
+    kotlinOptions {
+        freeCompilerArgs = ["-Xjsr305=strict"]
+
+        // Map Java target version to expected Gradle value
+        switch (java.targetCompatibility) {
+            case JavaVersion.VERSION_1_8: jvmTarget = "1.8"; break
+            case JavaVersion.VERSION_1_9: jvmTarget = "1.9"; break
+            case JavaVersion.VERSION_1_10: jvmTarget = "10"; break
+            case JavaVersion.VERSION_11: jvmTarget = "11"; break
+            case JavaVersion.VERSION_12: jvmTarget = "12"; break
+            default: throw new GradleException('Unknown Java version. You may need to update build.gradle to add it.')
+        }
+    }
+}
+
+tasks.jacocoTestReport {
+    reports {
+        xml.enabled true
+    }
+}
+
+checkstyleMain {
+    configProperties += [
+            'checkstyle.cache.file': file('build/checkstyleCacheFile')
+    ]
+}
+
+/* Disable Checkstyle reporting. It has to be present for Azure DevOps to consume
+    the data, but we instead fake it out by providing the data from Detekt */
+tasks.withType(Checkstyle) {
+    reports {
+        xml.enabled false
+        html.enabled false
+    }
+}
+
+// Simulate the output from the Checkstyle plugin, so Azure DevOps will pick it up
+tasks['detekt'].doLast {
+    mkdir "$buildDir/reports/checkstyle"
+    copy {
+        from "$buildDir/reports/detekt"
+        into "$buildDir/reports/checkstyle"
+        rename(/detekt\.([a-z]+)/, 'main.$1')
+    }
+}
+
+// Add health check to the standard Dockerfile
+dockerCreateDockerfile {
+    instruction 'HEALTHCHECK CMD wget --quiet --tries=1 --spider http://localhost:8080/actuator/health || exit 1'
+}
+
+docker {
+    springBootApplication {
+
+        // Determine the appropriate tag to use based on target JVM version
+        switch (java.targetCompatibility) {
+            case JavaVersion.VERSION_1_8:
+                baseImage = "openjdk:8-alpine"
+                break
+
+            case JavaVersion.VERSION_1_9:
+            case JavaVersion.VERSION_1_10:
+            case JavaVersion.VERSION_11:
+            case JavaVersion.VERSION_12:
+                baseImage = "openjdk:14-alpine"
+                break
+
+            default: throw new GradleException('Unknown Java version. You may need to update build.gradle to add it.')
+        }
+
+        maintainer = 'Daryl Robbins "daryl.robbins@canada.ca"'
+    }
+}
